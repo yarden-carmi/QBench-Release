@@ -452,6 +452,122 @@ def _spec_sample_descriptors():
 
 
 # ---------------------------------------------------------------------------
+# SuperPoint stages exposed by extra IPU kernel apps on opcode-reference
+# (border_threshold = threshold + remove_borders; top_k_keypoints;
+# keypoint_flip).  These didn't appear in the first cut of the harness
+# but the kernels exist, so include them so the comparison covers the
+# full SP pipeline.
+# ---------------------------------------------------------------------------
+
+
+def _spec_threshold_dense():
+    """Dense (H, 128) score-map threshold — matches BorderThresholdApp."""
+    def build(g, device):
+        H = 8
+        scores = torch.rand((H, 128), generator=g, device=device) * 0.01
+        threshold = 0.005
+        from runspace.src.ops.observed_ops import ObservedThreshold
+        op = ObservedThreshold(threshold=threshold).to(device).eval()
+
+        def run_fp32():
+            return torch.where(scores >= threshold, scores, torch.zeros_like(scores))
+
+        def run_qbench(q_type):
+            with torch.no_grad():
+                return run_fp32()
+
+        return OpInstance(
+            name='threshold',
+            inputs={'scores': scores, 'threshold': threshold},
+            input_desc=f"scores={tuple(scores.shape)}, threshold={threshold}",
+            run_fp32=run_fp32,
+            run_qbench=run_qbench,
+            ipu_inputs=lambda: {'scores': scores, 'threshold': threshold},
+        )
+
+    return OpSpec(name='threshold', family='superpoint', layer_kind='reduce',
+                  build=build, ipu_op_id='superpoint.threshold')
+
+
+def _spec_remove_borders_dense():
+    """Dense (H, 128) score-map border zeroing — matches BorderThresholdApp."""
+    def build(g, device):
+        H = 8
+        scores = torch.rand((H, 128), generator=g, device=device)
+        border = 4
+
+        def run_fp32():
+            mask_h = torch.ones(H, dtype=torch.bool, device=device)
+            mask_h[:border] = False
+            mask_h[H - border:] = False
+            mask_w = torch.ones(128, dtype=torch.bool, device=device)
+            mask_w[:border] = False
+            mask_w[128 - border:] = False
+            mask = mask_h[:, None] & mask_w[None, :]
+            return torch.where(mask, scores, torch.zeros_like(scores))
+
+        return OpInstance(
+            name='remove_borders',
+            inputs={'scores': scores, 'border': border},
+            input_desc=f"scores={tuple(scores.shape)}, border={border}",
+            run_fp32=run_fp32,
+            run_qbench=lambda q_type: run_fp32(),
+            ipu_inputs=lambda: {'scores': scores, 'border': border},
+        )
+
+    return OpSpec(name='remove_borders', family='superpoint', layer_kind='reduce',
+                  build=build, ipu_op_id='superpoint.remove_borders')
+
+
+def _spec_top_k_keypoints_dense():
+    """Top-K over a (H, 128) score map — matches TopKKeypointsApp."""
+    def build(g, device):
+        H = 4
+        scores = torch.randn((H, 128), generator=g, device=device).abs()
+        k = 16
+
+        def run_fp32():
+            flat = scores.reshape(-1)
+            vals, idx = torch.topk(flat, k)
+            rows = (idx // 128).float()
+            cols = (idx % 128).float()
+            return torch.stack([vals, rows, cols], dim=1)
+
+        return OpInstance(
+            name='top_k_keypoints',
+            inputs={'scores': scores, 'k': k},
+            input_desc=f"scores={tuple(scores.shape)}, k={k}",
+            run_fp32=run_fp32,
+            run_qbench=lambda q_type: run_fp32(),
+            ipu_inputs=lambda: {'scores': scores, 'k': k},
+        )
+
+    return OpSpec(name='top_k_keypoints', family='superpoint', layer_kind='argmax',
+                  build=build, ipu_op_id='superpoint.top_k_keypoints')
+
+
+def _spec_keypoint_flip_64():
+    """Pair-swap 64 (y,x) keypoints -> (x,y) — matches KeypointFlipApp."""
+    def build(g, device):
+        kpts = torch.randint(0, 256, (64, 2), generator=g, device=device, dtype=torch.int32)
+
+        def run_fp32():
+            return torch.flip(kpts.float(), dims=[1])
+
+        return OpInstance(
+            name='keypoint_flip',
+            inputs={'keypoints': kpts},
+            input_desc=f"kpts={tuple(kpts.shape)} int32",
+            run_fp32=run_fp32,
+            run_qbench=lambda q_type: run_fp32(),
+            ipu_inputs=lambda: {'keypoints': kpts},
+        )
+
+    return OpSpec(name='keypoint_flip', family='superpoint', layer_kind='reshape',
+                  build=build, ipu_op_id='superpoint.keypoint_flip')
+
+
+# ---------------------------------------------------------------------------
 # SuperGlue ops
 # ---------------------------------------------------------------------------
 
@@ -766,6 +882,13 @@ def build_op_specs() -> list[OpSpec]:
     specs.append(_spec_coord_ops())
     specs.append(_spec_grid_sample())
     specs.append(_spec_sample_descriptors())
+
+    # Extra SuperPoint stages backed by dedicated IPU kernel apps on
+    # the opcode-reference branch (border_threshold + topk + flip).
+    specs.append(_spec_threshold_dense())
+    specs.append(_spec_remove_borders_dense())
+    specs.append(_spec_top_k_keypoints_dense())
+    specs.append(_spec_keypoint_flip_64())
 
     # SuperGlue keypoint encoder MLP (Conv1d k=1)
     N = 32

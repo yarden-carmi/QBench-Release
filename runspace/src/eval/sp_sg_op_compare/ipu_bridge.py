@@ -1,9 +1,18 @@
 """Cross-repo bridge to the IPU-emulator's per-op runners.
 
-Today the IPU emulator only ships a fully-connected kernel.  Most
-SuperPoint and SuperGlue ops therefore have no IPU implementation yet:
-the bridge surfaces that as ``IpuKernelMissing`` so the comparison
-report makes the gap explicit op-by-op.
+The bridge talks to ``ipu_apps.sp_sg_compare.run_op`` and translates
+its three failure modes into distinct comparison-report statuses:
+
+  * **ipu_status='ok'** — runner returned a tensor.
+  * **ipu_status='kernel_not_implemented'** — runner raised
+    :class:`NotImplementedError` (op has a known recipe but no
+    asm/harness yet, or the kernel exists but the spec's input shape
+    doesn't fit).  Reported via :class:`IpuKernelMissing`.
+  * **ipu_status='isa_gap'** — runner raised the IPU side's ``IsaGap``
+    sentinel (subclass of NotImplementedError).  The op cannot be
+    expressed in the opcode-reference ISA at all (e.g. softmax /
+    attention / sinkhorn dropped per fa16059).  Reported via
+    :class:`IpuIsaGap`.
 
 Resolution order for the IPU package:
 
@@ -24,7 +33,17 @@ from typing import Any, Optional
 
 
 class IpuKernelMissing(RuntimeError):
-    """The IPU has no kernel for this op yet."""
+    """The IPU has no kernel for this op yet (recipe is known)."""
+
+
+class IpuIsaGap(RuntimeError):
+    """The op is outside the opcode-reference ISA on this branch.
+
+    Distinct from :class:`IpuKernelMissing`: missing-kernel ops have a
+    known recipe and just need the asm + harness to be written; ISA-gap
+    ops would require new ISA primitives, or were intentionally dropped
+    (e.g. softmax / attention / sinkhorn per fa16059).
+    """
 
 
 class IpuUnavailable(RuntimeError):
@@ -80,7 +99,12 @@ class IpuBridge:
     def run(self, op_id: str, inputs: dict, *, dtype: str) -> Any:
         if not self._available:
             raise IpuUnavailable(self._import_error or 'ipu-emulator unavailable')
+        # IsaGap is a subclass of NotImplementedError; check it first
+        # by name so we don't have to import the IPU module here.
+        IsaGap = getattr(self._mod, 'IsaGap', None)
         try:
             return self._mod.run_op(op_id, inputs, dtype=dtype)
         except NotImplementedError as e:
+            if IsaGap is not None and isinstance(e, IsaGap):
+                raise IpuIsaGap(str(e) or 'isa gap')
             raise IpuKernelMissing(str(e) or 'kernel pending')

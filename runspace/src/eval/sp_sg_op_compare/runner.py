@@ -10,6 +10,7 @@ import torch
 from runspace.src.eval.sp_sg_op_compare.op_specs import OP_SPECS, OpSpec
 from runspace.src.eval.sp_sg_op_compare.ipu_bridge import (
     IpuBridge,
+    IpuIsaGap,
     IpuKernelMissing,
     IpuUnavailable,
 )
@@ -155,6 +156,9 @@ def run_one(
                 res.ipu_vs_qbench_max_abs = _max_abs(ipu_out, qbench_out)
                 res.ipu_vs_qbench_mean_abs = _mean_abs(ipu_out, qbench_out)
                 res.ipu_vs_qbench_cosine = _cosine(ipu_out, qbench_out)
+        except IpuIsaGap as e:
+            res.ipu_status = 'isa_gap'
+            notes_parts.append(f"ipu: {e}")
         except IpuKernelMissing as e:
             res.ipu_status = 'kernel_not_implemented'
             notes_parts.append(f"ipu: {e}")
